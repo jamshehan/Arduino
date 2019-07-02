@@ -2,12 +2,11 @@
 #include "secrets.h"
 
 #include <WiFi.h>
-#include <Wire.h>
 #include <SFE_MicroOLED.h>
 #include <SparkFunBME280.h>
 #include <SparkFunCCS811.h>
 
-#define REFRESH_RATE 5000
+#define REFRESH_RATE 15000
 
 #define OLED_RESET_PIN 9
 #define OLED_JUMPER_MODE 1
@@ -33,36 +32,42 @@ BME280 bme280;
 
 CCS811 ccs881(CCS811_ADDRESS);
 
-void scanI2C() {
-  byte error, address;
-  int nDevices;
+bool connecting = false;
 
-  nDevices = 0;
-  for (address = 1; address < 127; address++ )
+void WIFI_Connect()
+{
+  WiFi.disconnect();
+  connecting = true;
+  
+  char wifiName[] = SECRET_SSID;
+  char wifiPassword[] = SECRET_PASS;
+  
+  Serial.print("Connecting to WiFi ");
+  Serial.print(wifiName);
+  Serial.println("...");
+    
+  WiFi.begin(wifiName, wifiPassword);
+  
+  for (int i = 0; i < 60; i++)
   {
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-
-    if (error == 0)
+    if ( WiFi.status() != WL_CONNECTED )
     {
-      Serial.print("I2C device found at address 0x");
-      if (address < 16)
-        Serial.print("0");
-      Serial.print(address, HEX);
-      Serial.println("!");
-
-      nDevices++;
-    }
-    else if (error == 4)
-    {
-      Serial.print("Unknow error at address 0x");
-      if (address < 16)
-        Serial.print("0");
-      Serial.println(address, HEX);
+      delay ( 250 );
+      digitalWrite(LED_BUILTIN, LOW);
+      Serial.print ( "." );
+      delay ( 250 );
+      digitalWrite(LED_BUILTIN, HIGH);
     }
   }
-  if (nDevices == 0)
-    Serial.println("No I2C devices found");
+  if ( WiFi.status() == WL_CONNECTED )
+  {
+    Serial.println("");
+    Serial.println("WiFi Connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+  connecting = false;
+  digitalWrite(LED_BUILTIN, 0);
 }
 
 void setup() {
@@ -71,34 +76,25 @@ void setup() {
   Serial.begin(9600);
 
   Serial.println("");
-  
-  char wifiName[] = SECRET_SSID;
-  char wifiPassword[] = SECRET_PASS;
-
-  Serial.print("WiFi ssid: ");
-  Serial.println(wifiName);
 
   Serial.print("ThingSpeak Channel: ");
   Serial.println(myChannelNumber);
     
-  WiFi.begin(wifiName, wifiPassword);
+  WIFI_Connect();
 
   server.begin();
-
-  Wire.begin();
-
-  scanI2C();
 
   oled.begin();
 
   bme280.settings.commInterface = I2C_MODE;
   bme280.settings.I2CAddress = BME280_ADDRESS;
-  bme280.settings.runMode = 3; //Normal mode
+  bme280.settings.runMode = MODE_FORCED;
   bme280.settings.tStandby = 0;
   bme280.settings.filter = 4;
-  bme280.settings.tempOverSample = 5;
-  bme280.settings.pressOverSample = 5;
-  bme280.settings.humidOverSample = 5;
+  bme280.settings.tempOverSample = 1;
+  bme280.settings.pressOverSample = 1;
+  bme280.settings.humidOverSample = 1;
+  bme280.settings.tempCorrection = -5; // -5C correction for sensor calibration
 
   delay(10);
 
@@ -109,30 +105,8 @@ void setup() {
   ThingSpeak.begin(wifiClient);  // Initialize ThingSpeak
 
   oled.clear(ALL);
-}
-
-String readRFID() {
-  byte tempTag = 0; 
-  long tempTime = 0; 
-  int shift = 24; 
-  long time = 0; 
-  String tagID; 
   
-  Wire.requestFrom((uint8_t)RFID_ADDRESS, (uint8_t)RFID_TOTAL_BYTES); 
-  for(int x = 0; x < RFID_TAG_BYTES; x++) {
-    tempTag = Wire.read();
-    tagID += (String)tempTag; 
-  }
-  
-  for (int x = 0; x < RFID_TIME_BYTES; x++){
-    // Time is fed a byte at a time onto the buffer so we need to put it back
-    // in order when we read it. 
-    tempTime = Wire.read();
-    time |= (tempTime << shift); 
-    shift = shift - 8; 
-  }
-
-  return tagID;
+  delay(2000);
 }
 
 long lastUpdate = millis();
@@ -144,6 +118,7 @@ float lastHumidity = 0;
 float lastPressure = 0;
 float lastCO2 = 0;
 float lastTVOC = 0;
+int lastHall = 0;
 
 void loop() {
   WiFiClient client = server.available();
@@ -177,6 +152,9 @@ void loop() {
             client.print("<p>TVOC: ");
             client.print(lastTVOC);
             client.print(" ppb</p>");
+            client.print("<p>Hall Value: ");
+            client.print(lastHall);
+            client.print("</p>");
             client.print("<p>Last update: ");
             client.print((millis() - lastUpdate) * 0.001);
             client.print(" s</p>");
@@ -198,13 +176,12 @@ void loop() {
     oled.clear(PAGE);
     oled.setFontType(0);
     oled.setCursor(0, 0);
-    oled.print(F("AirQuality"));
-    
-    oled.setCursor(0, 8);
-    switch (WiFi.status()) {
+
+    lastHall = hallRead();
+    wl_status_t wifiStatus = WiFi.status();
+
+    switch (wifiStatus) {
       case WL_CONNECTED: {
-          Serial.print("Connected to WiFi at: ");
-          Serial.println(WiFi.localIP());
           String ip = WiFi.localIP().toString();
           
           if (ip.length() > 10) {
@@ -220,41 +197,40 @@ void loop() {
         oled.print("WiFi error");
         break;
       case WL_IDLE_STATUS:
-        oled.print("Connecting");
+        oled.print("Connecting");        
         break;
       case WL_NO_SSID_AVAIL:
         oled.print("No SSID");
         break;
       case WL_CONNECTION_LOST:
         oled.print("Lost WiFi");
+        Serial.println("wifi disconnected ");
         break;
       case WL_DISCONNECTED:
         oled.print("No WiFi");
+        Serial.println("wifi disconnected ");
         break;
     }
-    
-    //oled.setCursor(0, 16);
-    //oled.print(readRFID().substring(0, 10));
 
+    if(wifiStatus != WL_CONNECTED && !connecting) {
+      WIFI_Connect();
+    }
+       
     lastTemperature = bme280.readTempF();
     lastHumidity = bme280.readFloatHumidity();
     lastPressure = bme280.readFloatPressure() * 0.001;
-  
+
+    oled.setCursor(0, 8);
+    oled.print(lastTemperature);
+    oled.print(" F");
+
+    oled.setCursor(0, 16);
+    oled.print(lastHumidity);
+    oled.print(" %");
+
     oled.setCursor(0, 24);
-    switch (scrollingToggle % 3) {
-      case 0:
-        oled.print(lastTemperature);
-        oled.print(" F");
-        break;
-      case 1:
-        oled.print(lastHumidity);
-        oled.print(" %");
-        break;
-      case 2:
-        oled.print(lastPressure);
-        oled.print(" kPa");
-        break;
-    }
+    oled.print(lastPressure);
+    oled.print(" kPa");
   
     ccs881.readAlgorithmResults();
 
@@ -262,16 +238,12 @@ void loop() {
     lastTVOC = ccs881.getTVOC();
   
     oled.setCursor(0, 32);
-    switch (scrollingToggle % 2) {
-      case 0:
-        oled.print(lastCO2, 0);
-        oled.print(" ppm");
-        break;
-      case 1:
-        oled.print(lastTVOC, 0);
-        oled.print(" ppb");
-        break;
-    }
+    oled.print(lastCO2, 0);
+    oled.print(" ppm");
+
+    oled.setCursor(0, 40);
+    oled.print(lastTVOC, 0);
+    oled.print(" ppb");
     
     oled.display();
   
@@ -285,13 +257,14 @@ void loop() {
     ThingSpeak.setField(3, lastPressure);
     ThingSpeak.setField(4, lastCO2);
     ThingSpeak.setField(5, lastTVOC);
+    ThingSpeak.setField(6, lastHall);
     int responseCode = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
     if(responseCode == 200){
       Serial.println("Channel update successful.");
     }
     else{
       Serial.println("Problem updating channel. HTTP error code " + String(responseCode));
-    }
+    }    
   
     digitalWrite(LED_BUILTIN, HIGH);
     delay(100);
